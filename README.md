@@ -1,4 +1,5 @@
 Framework
+
 We chose CrewAI as our framework. A framework is basically a set of pre-built tools and rules that helps organize how everything works together. CrewAI was the best fit because it's already built around roles and tasks, which is exactly how our system is set up: a CEO agent that hands off work to Finance, Sales, and other agents.
 
 We also looked at a few other options. Plain Python gives the most control but we'd have to build everything from scratch. AutoGen is good for back-and-forth conversations but isn't really role-focused. LangGraph is powerful but way more complex than we need right now.
