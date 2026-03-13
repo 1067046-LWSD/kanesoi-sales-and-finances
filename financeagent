@@ -1,0 +1,28 @@
+start FinanceAgent
+
+  when a message comes in:
+    read the task_type from the message
+    
+    if task_type is LOG_EXPENSE:
+      save the expense to the database
+      check if amount is over $10K
+        if yes, send alert to CEO
+      
+    if task_type is GENERATE_PL:
+      pull all revenue and expenses from database
+      calculate net profit/loss
+      send report to CEO
+      
+    if task_type is BURN_RATE_ALERT:
+      look at current spending vs revenue
+      calculate how many months of runway are left
+      if runway is low, send warning to CEO
+      
+    if task_type is ALLOCATE_BUDGET:
+      store the budget amounts per department
+      confirm back to CEO that it's saved
+
+  when sending a message:
+    wrap the result in the standard JSON envelope
+    set status to "done"
+    send it to the right agent
