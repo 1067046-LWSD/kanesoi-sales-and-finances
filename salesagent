@@ -1,0 +1,33 @@
+start SalesAgent
+
+  when a message comes in:
+    read the task_type from the message
+    
+    if task_type is QUALIFY_LEAD:
+      score the lead based on deal size and fit
+      save to CRM database
+      return score to CEO
+      
+    if task_type is GENERATE_PITCH:
+      take the lead info and product details
+      call the LLM to write a personalized message
+      return the pitch
+      
+    if task_type is LOG_REVENUE:
+      save the closed deal to the database
+      send the revenue amount over to Finance agent
+      
+    if task_type is PIPELINE_REPORT:
+      pull all active deals from the database
+      count leads, demos, closed deals
+      calculate projected revenue
+      send summary to CEO
+
+    if task_type is ESCALATE_DISCOUNT:
+      check if discount is above allowed threshold
+        if yes, forward to CEO for approval
+
+  when sending a message:
+    wrap the result in the standard JSON envelope
+    set status to "done"
+    send it to the right agent
