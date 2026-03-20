@@ -1,33 +1,63 @@
 start SalesAgent
-
   when a message comes in:
     read the task_type from the message
-    
+
     if task_type is QUALIFY_LEAD:
-      score the lead based on deal size and fit
-      save to CRM database
-      return score to CEO
-      
+      get name, deal_size, fit_score from payload
+      calculate score based on deal size and fit
+      if score is above threshold, mark as qualified
+      save lead to the deals database
+      send LEAD_QUALIFIED report to CEO
+        include lead name, score, qualified true/false
+
     if task_type is GENERATE_PITCH:
-      take the lead info and product details
-      call the LLM to write a personalized message
-      return the pitch
-      
+      get lead_name and product info from payload
+      use LLM to write a personalized outreach message
+      send PITCH_READY back to sender
+        include the generated pitch text
+
     if task_type is LOG_REVENUE:
-      save the closed deal to the database
-      send the revenue amount over to Finance agent
-      
+      get deal_name and amount from payload
+      save the closed deal with a timestamp to database
+      send REVENUE_LOGGED confirmation back to sender
+      notify Finance agent with the closed deal value
+        so Finance can reconcile and update its records
+
     if task_type is PIPELINE_REPORT:
-      pull all active deals from the database
-      count leads, demos, closed deals
-      calculate projected revenue
-      send summary to CEO
+      pull all active deals from database
+      count leads, demos, and closed deals
+      calculate projected revenue from open deals
+      include expected close dates per deal
+      send PIPELINE_SUMMARY to CEO
+        include leads, demos, closed, projected_revenue
+
+    if task_type is REVENUE_FORECAST:
+      look at current pipeline deals and stages
+      estimate likelihood of closing each deal
+      calculate projected monthly and quarterly revenue
+      send FORECAST_REPORT to Finance and CEO
+
+    if task_type is CUSTOMER_FEEDBACK:
+      get feedback, objections, feature requests from payload
+      forward to Product Manager agent
+      send FEEDBACK_DELIVERED confirmation back to sender
 
     if task_type is ESCALATE_DISCOUNT:
-      check if discount is above allowed threshold
-        if yes, forward to CEO for approval
+      get discount percentage from payload
+      if discount is above 20%:
+        send DISCOUNT_APPROVAL_NEEDED to CEO
+          include discount amount and reason
+          set status to "pending"
+      else:
+        send DISCOUNT_APPROVED back to sender
+          mark as auto_approved
 
   when sending a message:
-    wrap the result in the standard JSON envelope
-    set status to "done"
-    send it to the right agent
+    wrap result in standard JSON envelope
+      set sender to "Sales"
+      set recipient to the right agent
+      set task_type to the response type
+      put result data inside payload
+    set status to "done" (or "pending" if waiting on CEO)
+
+
