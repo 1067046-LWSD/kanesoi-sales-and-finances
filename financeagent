@@ -1,28 +1,57 @@
 start FinanceAgent
-
   when a message comes in:
     read the task_type from the message
-    
+
+    if task_type is APPROVE_SPEND:
+      get amount, department, justification from payload
+      check against that department's allocated budget
+      if amount is under $10K:
+        auto approve
+        send SPEND_APPROVED back to sender
+      if amount is over $10K:
+        send SPEND_ESCALATED to CEO
+          include amount, department, justification
+          set status to "pending"
+
     if task_type is LOG_EXPENSE:
-      save the expense to the database
-      check if amount is over $10K
-        if yes, send alert to CEO
-      
+      get amount, category, description from payload
+      save the expense with a unique ID and timestamp
+      send EXPENSE_LOGGED confirmation back to sender
+
     if task_type is GENERATE_PL:
-      pull all revenue and expenses from database
-      calculate net profit/loss
-      send report to CEO
-      
+      add up all revenue entries
+      add up all expense entries
+      subtract to get net profit/loss
+      send PL_REPORT to CEO
+        include total_revenue, total_expenses, net_profit_loss
+
     if task_type is BURN_RATE_ALERT:
-      look at current spending vs revenue
-      calculate how many months of runway are left
-      if runway is low, send warning to CEO
-      
+      calculate average monthly spending
+      calculate cash on hand (revenue minus expenses)
+      divide cash on hand by monthly burn to get runway in months
+      if runway is under 3 months:
+        include a warning in the report
+      send BURN_RATE_REPORT to CEO
+        include monthly_burn, runway_months, low_runway flag
+
     if task_type is ALLOCATE_BUDGET:
-      store the budget amounts per department
-      confirm back to CEO that it's saved
+      get department and amount from payload
+      store budget for that department
+      send BUDGET_ALLOCATED confirmation back to sender
+
+    if task_type is VALIDATE_REVENUE:
+      get deal info and amount from Sales agent
+      cross-check against Finance records
+      if it matches:
+        send REVENUE_CONFIRMED back to Sales
+      if it doesn't match:
+        send REVENUE_DISCREPANCY alert to CEO
 
   when sending a message:
-    wrap the result in the standard JSON envelope
-    set status to "done"
-    send it to the right agent
+    wrap result in standard JSON envelope
+      set sender to "Finance"
+      set recipient to the right agent
+      set task_type to the response type
+      put result data inside payload
+    set status to "done" (or "pending" if waiting on CEO)
+
