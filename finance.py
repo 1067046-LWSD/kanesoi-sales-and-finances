@@ -90,3 +90,11 @@ def handle_message(message):
             send_message("Sales", "REVENUE_CONFIRMED", result)
         else:
             send_message("CEO", "REVENUE_DISCREPANCY", result)
+
+# ── Test it ───────────────────────────────────────────────────────
+if __name__ == "__main__":
+    handle_message({
+        "sender": "CEO",
+        "task_type": "APPROVE_SPEND",
+        "payload": {"amount": 15000, "department": "Engineering", "justification": "New laptops"}
+    })
