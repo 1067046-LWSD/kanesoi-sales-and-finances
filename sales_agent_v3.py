@@ -1,459 +1,323 @@
 """
-Sales Agent — Week 6 (Final)
-Framework: CrewAI-style role/task architecture
+sales.py
+─────────────────────────────────────────────────────────────────────────────
+Sales Agent for the Kanosei virtual enterprise simulation.
 
-Tools (per design doc):
-  1. lead_scorer          — score and qualify leads from SQLite
-  2. message_writer       — Groq LLM personalized outreach (falls back to template)
-  3. deal_tracker         — query/update deals in SQLite leads + deals tables
-  4. notify_finance       — send closed deal info to Finance agent
-  5. objection_handler    — match objection to prepared response; escalate if unknown
+Token tracking is handled by the shared TokenManager (token_manager.py).
+GENERATE_PITCH and REVENUE_FORECAST are the two LLM-heavy tasks; they cost
+more and are tracked accordingly.  All other tasks are lightweight logic/DB
+operations with lower token costs.
 
-Decision Rules:
-  RULE 1: Leads with score < 50 → skip, move to nurture
-  RULE 2: Auto-pitch only high-fit leads with LLM; others get template
+Token cost summary for this agent
+───────────────────────────────────────────────────────────────────────────
+  Task                  Estimate   Notes
+  ──────────────────    ────────   ──────────────────────────────────────
+  QUALIFY_LEAD           700       Scoring algo + DB write
+  GENERATE_PITCH        2500       Full LLM call (personalised outreach)
+  LOG_REVENUE            400       DB write + two outbound messages
+  PIPELINE_REPORT       1200       Aggregate query + structured summary
+  REVENUE_FORECAST      1800       LLM probability estimates
+  CUSTOMER_FEEDBACK      500       Forward to PM + ack
+  ESCALATE_DISCOUNT      500       Threshold check + conditional route
+
+Monthly budget: 200,000 tokens
+Alerts fire at 80 % (WARNING) and 95 % (CRITICAL) consumed.
+─────────────────────────────────────────────────────────────────────────────
 """
 
-import json
-import logging
-import os
 import uuid
-from datetime import date
-from db_setup import get_conn, init_db, DB_PATH
-from message_schema import AgentMessage
-from finance_agent_v3 import FinanceAgent
+import json
+from datetime import datetime, timezone
 
-# Ensure DB exists
-if not os.path.exists(DB_PATH):
-    init_db()
-
+# Import the shared token manager so Finance + Sales share the same state.
+# In production you'd pass this in via dependency injection; here we import
+# the singleton created in finance.py to keep both agents on the same object.
 try:
-    from groq import Groq
-    _groq = Groq(api_key=os.environ.get("GROQ_API_KEY", ""))
-    GROQ_AVAILABLE = bool(os.environ.get("GROQ_API_KEY"))
+    from finance import token_manager  # shared instance
 except ImportError:
-    _groq = None
-    GROQ_AVAILABLE = False
+    from token_manager import TokenManager
+    token_manager = TokenManager()
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [SALES] %(message)s")
-log = logging.getLogger("sales")
-
-QUALIFY_THRESHOLD = 50
+AGENT_NAME = "Sales"
 
 
-# ══════════════════════════════════════════════════════════════════
-#  TOOL 1: Lead Scorer
-# ══════════════════════════════════════════════════════════════════
+# ── Stub Tools ────────────────────────────────────────────────────────────────
+# Stand-ins for HubSpot CRM, LLM pitch writer, SQLite, email sender, etc.
 
-def lead_scorer(lead_id: str = "", segment: str = "") -> dict:
-    """
-    Score a single lead (by id) or list all leads for a segment.
-    Applies RULE 1: score < 50 → not qualified.
-    """
-    conn = get_conn()
-    if lead_id:
-        row = conn.execute(
-            "SELECT id, company, contact, email, segment, size, fit, score, stage FROM leads WHERE id=?",
-            (lead_id,),
-        ).fetchone()
-        conn.close()
-        if not row:
-            return {"error": f"Lead {lead_id} not found"}
-        lead = dict(zip(["id","company","contact","email","segment","size","fit","score","stage"], row))
-        score = int(lead["score"])
-        qualified = score >= QUALIFY_THRESHOLD
-        lead["qualified"] = qualified
-        lead["next_action"] = "Schedule demo" if qualified else f"Score {score} < {QUALIFY_THRESHOLD} — add to nurture"
-        lead["rule_applied"] = None if qualified else "QUALIFY_THRESHOLD"
-        log.info(f"lead_scorer({lead_id}) → score={score}, qualified={qualified}")
-        return lead
-
-    else:
-        # List all leads, optionally filtered by segment
-        query = "SELECT id, company, contact, fit, score, stage FROM leads"
-        params = ()
-        if segment:
-            query += " WHERE segment=?"
-            params = (segment,)
-        rows = conn.execute(query, params).fetchall()
-        conn.close()
-        leads = []
-        for r in rows:
-            l = dict(zip(["id","company","contact","fit","score","stage"], r))
-            l["qualified"] = int(l["score"]) >= QUALIFY_THRESHOLD
-            leads.append(l)
-        log.info(f"lead_scorer(segment={segment}) → {len(leads)} leads")
-        return {"leads": leads, "count": len(leads), "segment": segment or "all"}
-
-
-# ══════════════════════════════════════════════════════════════════
-#  TOOL 2: Message Writer (LLM-powered)
-# ══════════════════════════════════════════════════════════════════
-
-def message_writer(company: str, contact: str = "", pain_point: str = "efficiency",
-                   fit: str = "medium") -> dict:
-    """
-    Write a personalized outreach email.
-    RULE 2: Only uses Groq LLM for high-fit leads. Others get a template.
-    """
-    # RULE 2
-    if fit != "high":
-        log.info(f"RULE 2: {company} is '{fit}' fit — template pitch only")
-        body = (f"Hi {contact or company}, we'd love to show you how our platform "
-                f"helps companies like {company} with {pain_point}. "
-                f"Would a quick 15-min call work this week?")
-        return {
-            "company": company, "contact": contact,
-            "subject": f"Quick question for {company}",
-            "body": body,
-            "cta": "Book a 15-min call",
-            "generated_by": "template",
-            "rule_applied": "HIGH_FIT_ONLY",
-        }
-
-    # High-fit: use Groq if available
-    if GROQ_AVAILABLE and _groq:
-        try:
-            prompt = (
-                f"Write a short B2B sales email for '{company}' (contact: {contact}). "
-                f"Pain point: '{pain_point}'. Under 80 words, conversational tone, "
-                f"end with a demo CTA. Output ONLY the email body."
-            )
-            resp = _groq.chat.completions.create(
-                model="llama-3.3-70b-versatile",
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=200,
-            )
-            body = resp.choices[0].message.content.strip()
-            generated_by = "groq-llama3.3-70b"
-            log.info(f"message_writer({company}) → LLM pitch generated")
-        except Exception as e:
-            log.warning(f"Groq error ({e}) — falling back to template")
-            body = f"Hi {contact or company}, our platform solves {pain_point} for companies like {company}. Want a quick demo?"
-            generated_by = "template-fallback"
-    else:
-        templates = {
-            "efficiency": f"Hi {contact or company}, teams like {company} cut manual work by 40% with us. Worth a look?",
-            "growth":     f"Hi {contact or company}, we help companies like {company} scale without the usual growing pains.",
-            "cost":       f"Hi {contact or company}, our customers at {company}-sized companies save ~$8K/year. Happy to show you how.",
-        }
-        body = templates.get(pain_point, templates["efficiency"])
-        generated_by = "template"
-        log.info(f"message_writer({company}) → template (no Groq key)")
-
+def score_lead(name, deal_size, fit_score):
+    """Simulate lead-scoring logic."""
+    score = (deal_size / 1_000) * 0.6 + fit_score * 0.4
     return {
-        "company": company, "contact": contact,
-        "subject": f"Quick question for {company}",
-        "body": body,
-        "cta": "Would you have 15 minutes this week for a quick demo?",
-        "generated_by": generated_by,
+        "lead_name":  name,
+        "score":      round(score, 2),
+        "qualified":  score >= 50,
+    }
+
+def generate_pitch_copy(lead_name, product_info):
+    """Simulate an LLM-generated personalised outreach email."""
+    return (
+        f"Hi {lead_name}, I wanted to reach out about {product_info}. "
+        "Based on what you're building, I think we can cut your time-to-close "
+        "by 30 %. Would a 20-minute call this week work for you?"
+    )
+
+def get_pipeline():
+    """Stub pipeline data."""
+    return {
+        "leads":              12,
+        "demos":               5,
+        "closed":              3,
+        "projected_revenue": 280_000,
+        "deals": [
+            {"name": "Acme Corp",    "stage": "demo",   "value": 48_000, "close_date": "2025-05-15"},
+            {"name": "Globex Inc",   "stage": "closed", "value": 72_000, "close_date": "2025-04-01"},
+            {"name": "Initech LLC",  "stage": "lead",   "value": 25_000, "close_date": "2025-06-01"},
+        ],
+    }
+
+def estimate_forecast(pipeline):
+    """Simulate revenue probability roll-up."""
+    stage_weights = {"lead": 0.20, "demo": 0.55, "closed": 1.00}
+    monthly  = sum(d["value"] * stage_weights.get(d["stage"], 0) for d in pipeline["deals"])
+    quarterly = monthly * 3
+    return {
+        "projected_monthly":   round(monthly),
+        "projected_quarterly": round(quarterly),
     }
 
 
-# ══════════════════════════════════════════════════════════════════
-#  TOOL 3: Deal Tracker
-# ══════════════════════════════════════════════════════════════════
+# ── Message Helper ────────────────────────────────────────────────────────────
 
-def deal_tracker(action: str, lead_id: str = "", stage: str = "",
-                 amount: float = 0, deal_id: str = "") -> dict:
-    """
-    action='pipeline'  → return all open deals
-    action='update'    → update a lead's stage
-    action='close'     → mark deal closed_won and log to deals table
-    """
-    conn = get_conn()
+def send_message(recipient, task_type, payload, status="done", sender=AGENT_NAME):
+    message = {
+        "id":        str(uuid.uuid4()),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "sender":    sender,
+        "recipient": recipient,
+        "task_type": task_type,
+        "context":   {},
+        "payload":   payload,
+        "status":    status,
+        "error":     "",
+    }
+    print(f"\n[{sender} → {recipient}] {task_type}")
+    print(json.dumps(message, indent=2))
+    return message
 
-    if action == "pipeline":
-        rows = conn.execute(
-            "SELECT id, company, contact, fit, score, stage FROM leads WHERE stage != 'closed_won'"
-        ).fetchall()
-        conn.close()
-        pipeline = [dict(zip(["id","company","contact","fit","score","stage"], r)) for r in rows]
-        log.info(f"deal_tracker(pipeline) → {len(pipeline)} open deals")
-        return {"pipeline": pipeline, "count": len(pipeline)}
 
-    elif action == "update":
-        conn.execute("UPDATE leads SET stage=? WHERE id=?", (stage, lead_id))
-        conn.commit()
-        conn.close()
-        log.info(f"deal_tracker(update) → {lead_id} moved to {stage}")
-        return {"lead_id": lead_id, "new_stage": stage, "status": "updated"}
+# ── Token guard helpers ───────────────────────────────────────────────────────
 
-    elif action == "close":
-        deal_id = deal_id or f"DEAL-{str(uuid.uuid4())[:4].upper()}"
-        row = conn.execute("SELECT company FROM leads WHERE id=?", (lead_id,)).fetchone()
-        company = row[0] if row else "Unknown"
-        conn.execute("UPDATE leads SET stage='closed_won' WHERE id=?", (lead_id,))
-        conn.execute(
-            "INSERT OR IGNORE INTO deals (deal_id, lead_id, company, amount, stage, close_date) VALUES (?,?,?,?,?,?)",
-            (deal_id, lead_id, company, amount, "closed_won", date.today().isoformat()),
+def _reserve(task_type: str) -> tuple[bool, str]:
+    ok, rid, err = token_manager.check_and_reserve(AGENT_NAME, task_type)
+    if not ok:
+        send_message("CEO", "BUDGET_EXCEEDED", err.get("payload", {}), status="error")
+    return ok, rid
+
+
+def _commit(rid: str, actual: int, sender: str):
+    alerts = token_manager.commit(rid, actual)
+    for alert in alerts:
+        send_message("CEO", alert["task_type"], alert["payload"])
+
+
+# ── Agent Loop ────────────────────────────────────────────────────────────────
+
+def handle_message(message: dict):
+    task_type = message["task_type"]
+    payload   = message.get("payload", {})
+    sender    = message.get("sender", "Unknown")
+
+    print(f"\n[SalesAgent] Received: {task_type} from {sender}")
+
+    # ── QUALIFY_LEAD ──────────────────────────────────────────────────────────
+    if task_type == "QUALIFY_LEAD":
+        ok, rid = _reserve(task_type)
+        if not ok:
+            return
+
+        result = score_lead(
+            payload["name"],
+            payload.get("deal_size", 0),
+            payload.get("fit_score", 0),
         )
-        conn.commit()
-        conn.close()
-        log.info(f"deal_tracker(close) → {deal_id} closed for ${amount}")
-        return {"deal_id": deal_id, "lead_id": lead_id, "company": company,
-                "amount": amount, "status": "closed_won"}
+        send_message("CEO", "LEAD_QUALIFIED", result)
 
-    conn.close()
-    return {"error": f"Unknown action: {action}"}
+        _commit(rid, actual=650, sender=sender)
+
+    # ── GENERATE_PITCH ────────────────────────────────────────────────────────
+    elif task_type == "GENERATE_PITCH":
+        ok, rid = _reserve(task_type)
+        if not ok:
+            return
+
+        pitch = generate_pitch_copy(
+            payload.get("lead_name", ""),
+            payload.get("product_info", "our product"),
+        )
+        send_message(sender, "PITCH_READY", {"pitch": pitch})
+
+        # LLM calls have variable cost – report actual tokens from the API
+        # response; here we use a realistic stub value.
+        actual_tokens = payload.get("actual_tokens", 2_200)
+        _commit(rid, actual=actual_tokens, sender=sender)
+
+    # ── LOG_REVENUE ───────────────────────────────────────────────────────────
+    elif task_type == "LOG_REVENUE":
+        ok, rid = _reserve(task_type)
+        if not ok:
+            return
+
+        deal = {"deal_name": payload["deal_name"], "amount": payload["amount"],
+                "closed_at": datetime.now(timezone.utc).isoformat()}
+
+        send_message(sender, "REVENUE_LOGGED", deal)
+
+        # Notify Finance so it can reconcile
+        send_message("Finance", "VALIDATE_REVENUE", {
+            "deal_name": payload["deal_name"],
+            "amount":    payload["amount"],
+        })
+
+        _commit(rid, actual=380, sender=sender)
+
+    # ── PIPELINE_REPORT ───────────────────────────────────────────────────────
+    elif task_type == "PIPELINE_REPORT":
+        ok, rid = _reserve(task_type)
+        if not ok:
+            return
+
+        pipeline = get_pipeline()
+        send_message("CEO", "PIPELINE_SUMMARY", pipeline)
+
+        _commit(rid, actual=1_100, sender=sender)
+
+    # ── REVENUE_FORECAST ──────────────────────────────────────────────────────
+    elif task_type == "REVENUE_FORECAST":
+        ok, rid = _reserve(task_type)
+        if not ok:
+            return
+
+        pipeline = get_pipeline()
+        forecast = estimate_forecast(pipeline)
+        send_message("Finance", "FORECAST_REPORT", forecast)
+        send_message("CEO",     "FORECAST_REPORT", forecast)
+
+        _commit(rid, actual=1_650, sender=sender)
+
+    # ── CUSTOMER_FEEDBACK ─────────────────────────────────────────────────────
+    elif task_type == "CUSTOMER_FEEDBACK":
+        ok, rid = _reserve(task_type)
+        if not ok:
+            return
+
+        feedback = {
+            "feedback":         payload.get("feedback", ""),
+            "objections":       payload.get("objections", []),
+            "feature_requests": payload.get("feature_requests", []),
+            "source":           payload.get("source", ""),
+        }
+        send_message("ProductManager", "FEEDBACK_FORWARDED", feedback)
+        send_message(sender, "FEEDBACK_DELIVERED", {"forwarded": True})
+
+        _commit(rid, actual=450, sender=sender)
+
+    # ── ESCALATE_DISCOUNT ─────────────────────────────────────────────────────
+    elif task_type == "ESCALATE_DISCOUNT":
+        ok, rid = _reserve(task_type)
+        if not ok:
+            return
+
+        discount_pct = payload.get("discount_pct", 0)
+
+        if discount_pct > 20:
+            send_message("CEO", "DISCOUNT_APPROVAL_NEEDED", {
+                "discount_pct": discount_pct,
+                "deal_name":    payload.get("deal_name", ""),
+                "reason":       payload.get("reason", ""),
+                "message":      f"{discount_pct}% discount exceeds 20% auto-approval limit",
+            }, status="pending")
+        else:
+            send_message(sender, "DISCOUNT_APPROVED", {
+                "discount_pct":  discount_pct,
+                "auto_approved": True,
+            })
+
+        _commit(rid, actual=430, sender=sender)
+
+    # ── TOKEN_REPORT (CEO can request a usage snapshot at any time) ───────────
+    elif task_type == "TOKEN_REPORT":
+        report = token_manager.report(AGENT_NAME)
+        send_message("CEO", "TOKEN_USAGE_REPORT", report)
+
+    else:
+        print(f"[SalesAgent] Unknown task_type: {task_type}")
 
 
-# ══════════════════════════════════════════════════════════════════
-#  TOOL 4: Notify Finance
-# ══════════════════════════════════════════════════════════════════
+# ── Test harness ──────────────────────────────────────────────────────────────
 
-def notify_finance(deal_id: str, company: str, amount: float) -> dict:
-    """
-    Send closed deal info to Finance agent via the standard message schema.
-    Finance agent logs it to revenue table.
-    """
-    finance = FinanceAgent()
-    msg = AgentMessage(
-        sender="SALES",
-        recipient="FINANCE",
-        task_type="LOG_EXPENSE",   # Finance treats incoming revenue as a credit entry
-        payload={
-            "category": "revenue_credit",
-            "amount": amount,
-            "department": "sales",
-            "month": date.today().strftime("%Y-%m"),
-            "note": f"Closed deal {deal_id} with {company}",
+if _name_ == "_main_":
+    test_messages = [
+        # Qualify a lead
+        {
+            "sender": "CEO",
+            "task_type": "QUALIFY_LEAD",
+            "payload": {"name": "Jane Smith / Acme Corp", "deal_size": 50_000, "fit_score": 85},
         },
-    )
-    # Also write directly to revenue table for P&L accuracy
-    conn = get_conn()
-    conn.execute(
-        "INSERT OR IGNORE INTO revenue (deal_id, company, amount, closed_date, source) VALUES (?,?,?,?,?)",
-        (deal_id, company, amount, date.today().isoformat(), "SALES"),
-    )
-    conn.commit()
-    conn.close()
-
-    log.info(f"notify_finance({deal_id}, ${amount}) → sent to Finance + logged to revenue")
-    return {
-        "deal_id": deal_id,
-        "company": company,
-        "amount": amount,
-        "status": "notified",
-        "message": f"✅ Finance notified. Deal {deal_id} (${amount:,.0f}) logged to revenue.",
-    }
-
-
-# ══════════════════════════════════════════════════════════════════
-#  TOOL 5: Objection Handler
-# ══════════════════════════════════════════════════════════════════
-
-OBJECTION_RESPONSES = {
-    "too expensive": "We offer flexible pricing and a 30-day free trial — most teams see ROI within 60 days.",
-    "already have a solution": "Happy to do a quick comparison. Many customers switched after seeing our integration options.",
-    "not the right time": "No problem at all — can I check back in next quarter? I'll send some resources in the meantime.",
-    "need to talk to my team": "Totally understand! I can prepare a one-pager for your team if that would help.",
-    "not interested": "Appreciate the honesty! If anything changes, we're here. Mind if I follow up in 3 months?",
-    "too complex": "We have a dedicated onboarding team and most customers are live in under a week.",
-}
-
-def objection_handler(objection: str) -> dict:
-    """
-    Match a sales objection to a prepared response.
-    Escalates to CEO if the objection is unknown.
-    """
-    objection_lower = objection.lower().strip()
-
-    # Try exact or partial match
-    for key, response in OBJECTION_RESPONSES.items():
-        if key in objection_lower:
-            log.info(f"objection_handler matched: '{key}'")
-            return {
-                "objection": objection,
-                "matched_key": key,
-                "response": response,
-                "escalate": False,
-            }
-
-    # No match — escalate
-    log.warning(f"objection_handler: no match for '{objection}' — escalating")
-    return {
-        "objection": objection,
-        "matched_key": None,
-        "response": "Escalating to senior rep for a custom response.",
-        "escalate": True,
-        "escalation_reason": f"Unknown objection: '{objection}' — needs human or CEO review.",
-    }
-
-
-# ══════════════════════════════════════════════════════════════════
-#  DECISION RULES
-# ══════════════════════════════════════════════════════════════════
-
-def rule_skip_low_score(lead: dict) -> dict | None:
-    if lead.get("qualified") is False:
-        return {
-            "rule": "LOW_SCORE_SKIP",
-            "lead_id": lead.get("id"),
-            "company": lead.get("company"),
-            "score": lead.get("score"),
-            "action": "Moved to nurture sequence — no outreach sent.",
-        }
-    return None
-
-
-def rule_escalate_objection(objection_result: dict) -> dict | None:
-    if objection_result.get("escalate"):
-        return {
-            "rule": "UNKNOWN_OBJECTION_ESCALATE",
-            "escalate_to": "CEO",
-            "objection": objection_result.get("objection"),
-            "message": objection_result.get("escalation_reason"),
-        }
-    return None
-
-
-# ══════════════════════════════════════════════════════════════════
-#  TOOL ROUTER
-# ══════════════════════════════════════════════════════════════════
-
-def route_tool(task_type: str, payload: dict) -> tuple[dict, dict | None]:
-    task = task_type.upper()
-    rule_notice = None
-
-    if task == "SCORE_LEAD":
-        result = lead_scorer(lead_id=payload.get("lead_id", ""), segment=payload.get("segment", ""))
-        if "qualified" in result:
-            rule_notice = rule_skip_low_score(result)
-
-    elif task == "WRITE_MESSAGE":
-        result = message_writer(
-            company=payload.get("company", ""),
-            contact=payload.get("contact", ""),
-            pain_point=payload.get("pain_point", "efficiency"),
-            fit=payload.get("fit", "medium"),
-        )
-
-    elif task == "PIPELINE":
-        result = deal_tracker(action="pipeline")
-
-    elif task == "UPDATE_DEAL":
-        result = deal_tracker(action="update", lead_id=payload.get("lead_id", ""), stage=payload.get("stage", ""))
-
-    elif task == "CLOSE_DEAL":
-        result = deal_tracker(
-            action="close",
-            lead_id=payload.get("lead_id", ""),
-            amount=float(payload.get("amount", 0)),
-            deal_id=payload.get("deal_id", ""),
-        )
-
-    elif task == "NOTIFY_FINANCE":
-        result = notify_finance(
-            deal_id=payload.get("deal_id", ""),
-            company=payload.get("company", ""),
-            amount=float(payload.get("amount", 0)),
-        )
-
-    elif task == "HANDLE_OBJECTION":
-        result = objection_handler(objection=payload.get("objection", ""))
-        rule_notice = rule_escalate_objection(result)
-
-    else:
-        result = {"error": f"Unknown task_type: {task_type}"}
-
-    return result, rule_notice
-
-
-# ══════════════════════════════════════════════════════════════════
-#  AGENT LOOP (CrewAI-compatible interface)
-# ══════════════════════════════════════════════════════════════════
-
-class SalesAgent:
-    """
-    Sales Agent — CrewAI-style role.
-    Same 3-step interface as all other agents:
-      1. receive()  — parse incoming message
-      2. handle()   — run tools + apply decision rules
-      3. respond()  — wrap result in standard message envelope
-    """
-    name = "SALES"
-
-    def receive(self, message: AgentMessage) -> str:
-        log.info(f"Received '{message.task_type}' from {message.sender}")
-        return message.task_type
-
-    def handle(self, message: AgentMessage) -> list[AgentMessage]:
-        self.receive(message)
-        responses = []
-
-        try:
-            result, rule_notice = route_tool(message.task_type, message.payload)
-            status, error = "done", ""
-        except Exception as e:
-            result, rule_notice = {}, None
-            status, error = "error", str(e)
-            log.error(f"Tool error: {e}")
-
-        responses.append(self.respond(
-            recipient=message.sender,
-            task_type=f"{message.task_type}_RESPONSE",
-            payload=result,
-            context=message.context,
-            status=status,
-            error=error,
-        ))
-
-        if rule_notice:
-            recipient = rule_notice.get("escalate_to", message.sender)
-            responses.append(self.respond(
-                recipient=recipient,
-                task_type="RULE_NOTICE" if recipient != "CEO" else "ESCALATION",
-                payload=rule_notice,
-                context={"triggered_by": message.task_type},
-                status="pending" if recipient == "CEO" else "done",
-            ))
-            log.info(f"Rule notice → {recipient}: {rule_notice['rule']}")
-
-        return responses
-
-    def respond(self, recipient: str, task_type: str, payload: dict,
-                context: dict = None, status: str = "done", error: str = "") -> AgentMessage:
-        return AgentMessage(
-            sender=self.name,
-            recipient=recipient,
-            task_type=task_type,
-            payload=payload,
-            context=context or {},
-            status=status,
-            error=error,
-        )
-
-
-# ─────────────────────── Quick self-test ───────────────────────────
-
-if __name__ == "__main__":
-    agent = SalesAgent()
-    tests = [
-        AgentMessage(sender="CEO", recipient="SALES", task_type="SCORE_LEAD",
-                     payload={"lead_id": "L-002"}),   # score=42 → RULE 1
-        AgentMessage(sender="CEO", recipient="SALES", task_type="SCORE_LEAD",
-                     payload={"lead_id": "L-004"}),   # score=91 → passes
-        AgentMessage(sender="CEO", recipient="SALES", task_type="WRITE_MESSAGE",
-                     payload={"company": "Nexus Corp", "contact": "David Chen",
-                              "pain_point": "growth", "fit": "high"}),
-        AgentMessage(sender="CEO", recipient="SALES", task_type="WRITE_MESSAGE",
-                     payload={"company": "Vertex Solutions", "contact": "Amy Wallace",
-                              "pain_point": "efficiency", "fit": "medium"}),  # RULE 2
-        AgentMessage(sender="CEO", recipient="SALES", task_type="PIPELINE", payload={}),
-        AgentMessage(sender="CEO", recipient="SALES", task_type="HANDLE_OBJECTION",
-                     payload={"objection": "too expensive"}),
-        AgentMessage(sender="CEO", recipient="SALES", task_type="HANDLE_OBJECTION",
-                     payload={"objection": "we use blockchain for everything"}),  # unknown → escalate
-        AgentMessage(sender="CEO", recipient="SALES", task_type="CLOSE_DEAL",
-                     payload={"lead_id": "L-003", "amount": 3600, "deal_id": "DEAL-105"}),
-        AgentMessage(sender="CEO", recipient="SALES", task_type="NOTIFY_FINANCE",
-                     payload={"deal_id": "DEAL-105", "company": "Corner Bookshop", "amount": 3600}),
+        # Generate a pitch
+        {
+            "sender": "CEO",
+            "task_type": "GENERATE_PITCH",
+            "payload": {"lead_name": "Jane Smith", "product_info": "Kanosei Enterprise Suite"},
+        },
+        # Log a closed deal
+        {
+            "sender": "CEO",
+            "task_type": "LOG_REVENUE",
+            "payload": {"deal_name": "Acme Corp", "amount": 48_000},
+        },
+        # Pipeline snapshot
+        {
+            "sender": "CEO",
+            "task_type": "PIPELINE_REPORT",
+            "payload": {},
+        },
+        # Revenue forecast
+        {
+            "sender": "CEO",
+            "task_type": "REVENUE_FORECAST",
+            "payload": {},
+        },
+        # Customer feedback forwarded to PM
+        {
+            "sender": "CEO",
+            "task_type": "CUSTOMER_FEEDBACK",
+            "payload": {
+                "feedback":         "Onboarding is too slow",
+                "objections":       ["price", "integration complexity"],
+                "feature_requests": ["Slack integration", "CSV export"],
+                "source":           "Acme Corp",
+            },
+        },
+        # Discount below threshold → auto-approved
+        {
+            "sender": "AE",
+            "task_type": "ESCALATE_DISCOUNT",
+            "payload": {"discount_pct": 15, "deal_name": "Globex Inc", "reason": "Competitive pressure"},
+        },
+        # Discount above threshold → escalate to CEO
+        {
+            "sender": "AE",
+            "task_type": "ESCALATE_DISCOUNT",
+            "payload": {"discount_pct": 30, "deal_name": "Initech LLC", "reason": "Strategic account"},
+        },
+        # CEO requests a token usage report
+        {
+            "sender": "CEO",
+            "task_type": "TOKEN_REPORT",
+            "payload": {},
+        },
     ]
-    for msg in tests:
-        print(f"\n{'='*55}\nTASK: {msg.task_type} | {msg.payload}")
-        for r in agent.handle(msg):
-            tag = "📨 ESCALATION" if r.task_type == "ESCALATION" else \
-                  "🔔 RULE NOTICE" if r.task_type == "RULE_NOTICE" else "✅ RESPONSE"
-            print(f"\n{tag} → {r.recipient}")
-            print(json.dumps(r.to_dict(), indent=2))
+
+    for msg in test_messages:
+        handle_message(msg)
+        print("\n" + "─" * 70)
