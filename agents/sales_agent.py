@@ -1,5 +1,5 @@
 """
-agents/sales_agent.py — Sales Agent (Group 5: Aarav, Saketh, Nimeshikaa)
+agents/sales_agent.py — Sales Agent (Group 5)
 
 Responsibilities:
   - Prospect and qualify leads (BANT scoring)

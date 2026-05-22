@@ -41,7 +41,6 @@ def print_banner():
     print("""
 ╔══════════════════════════════════════════════════════════╗
 ║   Finance + Sales Agent System — Group 5                ║
-║   Team: Aarav Gumber · Saketh Madiraju · Nimeshikaa S.  ║
 ╚══════════════════════════════════════════════════════════╝
 """)
 
@@ -161,7 +160,7 @@ async def run_demo():
     print("\n── Step 3: Sales qualifies leads ──")
     for lead_id in ["lead-001", "lead-003", "lead-004"]:
         q = qualify_lead(lead_id)
-        print(f"  {lead_id} ({q['company']}): score={q['score']} → {'✅ QUALIFIED' if q['qualified'] else '❌ Not qualified'}")
+        print(f"  {lead_id} ({q['company']}): score={q['score']} → {'QUALIFIED' if q['qualified'] else 'Not qualified'}")
 
     print("\n── Step 4: Sales generates pitch for AcmeCorp ──")
     print(generate_pitch("lead-001")["pitch"])
@@ -182,7 +181,7 @@ async def run_demo():
     print("\n── Step 9: Session token stats ──")
     print(json.dumps(bus.get_session_stats(), indent=2))
 
-    print("\n✅ Demo complete.\n")
+    print("\nDemo complete.\n")
 
 
 # ---------------------------------------------------------------------------
@@ -224,7 +223,7 @@ async def run_live():
     await asyncio.gather(seed_tasks(), finance.run(max_cycles=20), sales.run(max_cycles=20))
 
     bus.dump_log("logs/session_log.json")
-    print("\n📊 Final Stats:")
+    print("\nFinal Stats:")
     print(json.dumps(finance.get_status(), indent=2))
     print(json.dumps(sales.get_status(), indent=2))
     print(json.dumps(bus.get_session_stats(), indent=2))

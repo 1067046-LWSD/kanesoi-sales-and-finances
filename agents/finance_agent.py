@@ -1,5 +1,5 @@
 """
-agents/finance_agent.py — Finance Agent (Group 5: Aarav, Saketh, Nimeshikaa)
+agents/finance_agent.py — Finance Agent (Group 5)
 
 Responsibilities:
   - Budget allocation and tracking

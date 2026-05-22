@@ -1,6 +1,4 @@
 # Finance + Sales Agent — Group 5
-**Team**: Aarav Gumber (Lead) · Saketh Madiraju · Nimeshikaa Saravanakumar
-
 AI Enterprise Agent Program — 12-Week Project
 
 ---
@@ -129,17 +127,17 @@ Max budget: **1,000 tokens per call**. All calls log to `db/finance.db:token_cos
 
 | Week | Deliverable | Status |
 |---|---|---|
-| 1–2 | Role mapping, one-pager | ✅ |
-| 3 | Design doc + schema | ✅ |
-| 4 | Pseudocode + repo setup | ✅ |
-| 5 | Skeleton with stub tools | ✅ |
-| 6 | Real tools (4/2/2026) | ✅ |
-| 7 | Message bus + CEO routing | ✅ |
-| 8 | Full scenario run | 🔄 |
-| 9 | Tests + metrics | ✅ |
-| 10 | Chaos tests + reliability | ✅ |
-| 11 | Stretch: UI dashboard | 🔄 |
-| 12 | Final demo | ⏳ |
+| 1–2 | Role mapping, one-pager | Done |
+| 3 | Design doc + schema | Done |
+| 4 | Pseudocode + repo setup | Done |
+| 5 | Skeleton with stub tools | Done |
+| 6 | Real tools (4/2/2026) | Done |
+| 7 | Message bus + CEO routing | Done |
+| 8 | Full scenario run | In progress |
+| 9 | Tests + metrics | Done |
+| 10 | Chaos tests + reliability | Done |
+| 11 | Stretch: UI dashboard | In progress |
+| 12 | Final demo | Pending |
 
 ---
 
